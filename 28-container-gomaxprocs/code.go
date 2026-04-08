@@ -4,68 +4,43 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"runtime"
-	"time"
-
-	"go.uber.org/automaxprocs/maxprocs"
 )
 
+// 注意：Go 1.25+ 的 runtime 已经内置了容器感知的 GOMAXPROCS。
+// 无需外部库，runtime 启动时就会自动根据 cgroup CPU limit 调整 GOMAXPROCS。
+//
+// 本示例演示 Go 1.25+ 的内置行为。
+
 func main() {
-	// 演示问题：不使用 maxprocs 时，GOMAXPROCS 返回宿主机的核数
-	fmt.Println("=== 问题演示：未使用 maxprocs ===")
+	fmt.Println("=== Go 1.25+ 容器 GOMAXPROCS 行为 ===")
+	fmt.Println()
+
+	// NumCPU() 返回当前进程通过 sched_getaffinity 可见的逻辑 CPU 数
+	// 这是宿主机视角的值，不受 cgroup 限制影响
 	fmt.Printf("runtime.NumCPU(): %d\n", runtime.NumCPU())
+	fmt.Printf("  (这是宿主机可见的逻辑 CPU 数)\n")
+	fmt.Println()
+
+	// GOMAXPROCS(0) 返回当前 GOMAXPROCS 设置
+	// 在 Go 1.25+ 容器环境中，这会自动被 cgroup CPU limit 限制
+	//
+	// 计算公式：min(NumCPU, max(ceil(quota/period), 2))
+	//
+	// 例如容器限制为 500m (0.5 CPU)：
+	//   quota/period ≈ 0.5 → ceil(0.5) = 1 → max(1, 2) = 2
+	//   min(8, 2) = 2
 	fmt.Printf("runtime.GOMAXPROCS(0): %d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("  (这是 runtime 根据 cgroup limit 自动调整后的值)\n")
 	fmt.Println()
 
-	// 使用 maxprocs.Set 自动设置正确的 GOMAXPROCS
-	fmt.Println("=== 使用 maxprocs.Set 自动设置 ===")
-	// Set 会自动读取 cgroup 配置并设置 GOMAXPROCS
-	// 使用 Logger 选项可以看到设置日志
-	undo, err := maxprocs.Set(maxprocs.Logger(log.Printf))
-	if err != nil {
-		// 在非容器环境或无法获取 cgroup 信息时，err 可能不为 nil
-		fmt.Printf("maxprocs warning: %v\n", err)
-	}
-	defer undo() // 可以通过 undo() 恢复之前的设置
+	// 手动设置 GOMAXPROCS 会覆盖默认值
+	// 设置后可以通过 GOMAXPROCS(0) 查看当前值
+	original := runtime.GOMAXPROCS(4)
+	fmt.Printf("手动设置 GOMAXPROCS=4，原值: %d\n", original)
+	fmt.Printf("设置后 runtime.GOMAXPROCS(0): %d\n", runtime.GOMAXPROCS(0))
 
-	fmt.Printf("自动设置后 runtime.GOMAXPROCS(0): %d\n", runtime.GOMAXPROCS(0))
-	fmt.Println()
-
-	// 模拟工作负载，观察调度行为
-	fmt.Println("=== 工作负载演示 ===")
-	simulateWorkload()
-}
-
-func simulateWorkload() {
-	const goroutineCount = 10
-	done := make(chan struct{}, goroutineCount)
-
-	start := time.Now()
-	for i := 0; i < goroutineCount; i++ {
-		go func(id int) {
-			// 模拟 CPU 密集型工作
-			_ = computeSomething()
-			done <- struct{}{}
-		}(i)
-	}
-
-	// 等待所有 goroutine 完成
-	for i := 0; i < goroutineCount; i++ {
-		<-done
-	}
-
-	fmt.Printf("完成 %d 个 goroutine，耗时: %v\n", goroutineCount, time.Since(start))
-	fmt.Printf("当前 GOMAXPROCS: %d\n", runtime.GOMAXPROCS(0))
-	fmt.Printf("当前 Goroutine 数量: %d\n", runtime.NumGoroutine())
-}
-
-func computeSomething() int {
-	// 模拟一些计算工作
-	const iterations = 1000000
-	sum := 0
-	for i := 0; i < iterations; i++ {
-		sum += i % 10
-	}
-	return sum
+	// 恢复为默认值（让 runtime 重新计算）
+	runtime.GOMAXPROCS(original)
+	fmt.Printf("恢复后 runtime.GOMAXPROCS(0): %d\n", runtime.GOMAXPROCS(0))
 }

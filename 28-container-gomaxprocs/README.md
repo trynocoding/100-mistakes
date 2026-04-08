@@ -2,35 +2,70 @@
 
 ## 问题背景
 
-在容器化环境中运行 Go 应用时，`runtime.GOMAXPROCS()` 函数会返回**宿主机**的 CPU 核心数，而不是容器被限制的 CPU 核心数。这会导致以下问题：
+在 **Go 1.25 之前**，在容器化环境中运行 Go 应用时，`runtime.GOMAXPROCS()` 函数会返回宿主机的 CPU 核心数，而不是容器被限制的 CPU 核心数。
 
-1. **资源超限**：Go 运行时创建的 goroutine 数量基于宿主机核数，可能超出容器 cgroup 限制
-2. **性能下降**：频繁的 CPU 竞争和上下文切换
-3. **资源浪费**：无法准确评估容器需要的资源配额
-4. **调度不准确**：`runtime.NumGoroutine()` 和 `GOMAXPROCS()` 不一致
-
-### 问题示例
-
-假设宿主机有 32 核，容器被限制为 2 核：
-
-```go
-// 容器中运行
-fmt.Println("GOMAXPROCS:", runtime.GOMAXPROCS(0))        // 输出: 32（错误！）
-fmt.Println("NumCPU:", runtime.NumCPU())                  // 输出: 32（错误！）
-fmt.Println("容器 cgroup 限制: 2 核")
-```
-
-实际上 Go 运行时会尝试在这 32 个 CPU 上调度 goroutine，但容器的 cgroup 限制只有 2 核，导致资源不匹配。
-
-### 根本原因
-
-`runtime.GOMAXPROCS()` 和 `runtime.NumCPU()` 底层调用的是系统的 `sched_getaffinity()`（Linux）或类似接口，这些接口返回的是宿主机视角的 CPU 核心数，而不是容器 cgroup 视角的限制。
+**从 Go 1.25 起**，Go runtime 已经**内置**了容器感知的 GOMAXPROCS 自动调整机制，不再需要依赖外部库。
 
 ---
 
-## 解决方案
+## Go 1.25+ 的内置行为
 
-使用 `go.uber.org/automaxprocs/maxprocs` 库，它会自动读取容器 cgroup 配置并设置正确的 GOMAXPROCS 值。
+### 核心规则
+
+Go 1.25+ 的 runtime 在启动时会自动检测容器 cgroup CPU 限制，`GOMAXPROCS` 默认值按以下公式计算：
+
+```
+GOMAXPROCS = min(sched_getaffinity可见CPU数, max(ceil(quota/period), 2))
+```
+
+### 公式解释
+
+1. **`sched_getaffinity` 可见的逻辑 CPU 数**：宿主机视角的可用 CPU 数
+2. **cgroup CPU 吞吐限制**：`quota / period`
+   - 小于 2 的值会提升到 2（最小保底值）
+   - 带小数的值会向上取整
+3. **取两者中的较小值**
+
+### 计算示例
+
+假设容器 CPU limit 为 `500m`（0.5 CPU）：
+
+```
+quota / period ≈ 0.5
+ceil(0.5) = 1
+max(1, 2) = 2
+min(8, 2) = 2
+```
+
+即使容器限制是 0.5 CPU，`GOMAXPROCS` 也会是 2（因为最小保底值是 2）。
+
+### cgroup 信息来源
+
+- **cgroup v2**：读取 `cpu.max`
+- **cgroup v1**：读取 `cpu.cfs_quota_us` 和 `cpu.cfs_period_us`
+
+---
+
+## 实际验证
+
+```go
+// 在容器中运行（容器限制 500m）
+fmt.Println("NumCPU:     =", runtime.NumCPU())      // 输出: 8（宿主机逻辑CPU）
+fmt.Println("GOMAXPROCS =", runtime.GOMAXPROCS(0))   // 输出: 2（cgroup限制）
+```
+
+这正是 Go 1.25+ runtime 的预期行为。
+
+---
+
+## 何时仍需要 automaxprocs
+
+`go.uber.org/automaxprocs` 在以下场景仍有价值：
+
+1. **Go 版本 < 1.25**：需要手动设置正确的 GOMAXPROCS
+2. **需要显式控制**：不想依赖 runtime 默认行为
+3. **特殊 cgroup 配置**：非标准 cgroup 路径或层级
+4. **需要日志记录**：查看 GOMAXPROCS 是如何被计算的
 
 ### 安装
 
@@ -39,10 +74,6 @@ go get go.uber.org/automaxprocs
 ```
 
 ### 使用方法
-
-#### 方式一：自动设置（推荐）
-
-只需导入包，即可在 `init()` 函数中自动完成设置：
 
 ```go
 import "go.uber.org/automaxprocs"
@@ -53,9 +84,7 @@ func main() {
 }
 ```
 
-#### 方式二：手动控制（带日志）
-
-使用 `maxprocs.Set()` 函数进行手动控制，并可选地设置日志回调：
+### 手动控制
 
 ```go
 import (
@@ -64,13 +93,11 @@ import (
 )
 
 func main() {
-    // Set 会自动读取 cgroup 配置并设置 GOMAXPROCS
     undo, err := maxprocs.Set(maxprocs.Logger(log.Printf))
     if err != nil {
-        // 在非容器环境或无法获取 cgroup 信息时，err 可能不为 nil
         log.Printf("maxprocs warning: %v", err)
     }
-    defer undo() // 可以通过 undo() 恢复之前的设置
+    defer undo()
 
     fmt.Println("GOMAXPROCS:", runtime.GOMAXPROCS(0))
 }
@@ -78,25 +105,27 @@ func main() {
 
 ---
 
-## 注意事项
+## 常见误区
 
-1. **调用时机**：使用 `maxprocs.Set()` 时，必须在 Go 运行时初始化后、任何需要并行度的操作之前调用
-2. **依赖库**：如果使用了支持 automaxprocs 的库（如 `uber-go/goleak`），可能已自动集成
-3. **Kubernetes**：在 K8s 环境中，cgroup 限制通常与 CPU 请求/限制一致，automaxprocs 可以正确识别
-4. **本地开发**：在非容器环境中，automaxprocs 不会做任何修改，保持原有行为
+### 误区 1：NumCPU 和 GOMAXPROCS 是同一个值
 
----
+**错误**。在 Go 1.25+ 容器环境中：
+- `NumCPU()` = 宿主机可见的逻辑 CPU 数（通常是 8）
+- `GOMAXPROCS(0)` = cgroup 限制调整后的值（通常是 2）
 
-## 验证方法
+### 误区 2：GOMAXPROCS=1 表示单核
 
-运行示例代码，观察输出：
-- 在容器中：`GOMAXPROCS` 应等于容器 CPU 限制
-- 本地环境：应等于机器实际核数
+**错误**。GOMAXPROCS=1 只表示运行时同时最多调度 1 个 OS 线程来执行 goroutine，但 goroutine 总数不受限制。
+
+### 误区 3：500m 限制会得到 GOMAXPROCS=1
+
+**错误**。由于最小保底值是 2，所以 `500m`、`250m` 等小于 2 的限制都会得到 `GOMAXPROCS=2`。
 
 ---
 
 ## 相关阅读
 
+- [Go 1.25 Release Notes](https://go.dev/doc/go1.25)
+- [Container-aware GOMAXPROCS](https://go.dev/blog/container-aware-gomaxprocs)
+- [Go runtime cgroup_linux.go](https://go.dev/src/runtime/cgroup_linux.go)
 - [uber-go/automaxprocs 官方文档](https://pkg.go.dev/go.uber.org/automaxprocs)
-- [Go runtime NumCPU 文档](https://pkg.go.dev/runtime#NumCPU)
-- [Linux cgroups CPU 子系统](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
