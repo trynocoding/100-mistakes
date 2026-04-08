@@ -58,6 +58,51 @@ fmt.Println("GOMAXPROCS =", runtime.GOMAXPROCS(0))   // 输出: 2（cgroup限制
 
 ---
 
+## 已知局限
+
+### 1. 只读取叶子 cgroup
+
+Go runtime 只读取**当前进程所在叶子 cgroup** 的 CPU limit，**不会检查父 cgroup**。
+
+```go
+// We only read the limit from the leaf cgroup that actually contains this
+// process. But a parent cgroup may have a tighter limit. That tighter limit
+// would be our effective limit.
+```
+
+这意味着如果父 cgroup 有更严格的限制，它不会被应用。不过容器运行时通常会把父 cgroup 隐藏。
+
+### 2. 进程迁移到其他 cgroup 不生效
+
+cgroup 检测只在**启动时执行一次**：
+
+```go
+// If the process is migrated to another cgroup while it is running it will
+// not notice, as we only check which cgroup we are in once at startup.
+```
+
+如果进程在运行期间被迁移到其他 cgroup，Go runtime 不会感知到新的 CPU limit。
+
+### 3. 可通过 GODEBUG 禁用
+
+```bash
+GODEBUG=containermaxprocs=0 ./your_program
+```
+
+```go
+if debug.containermaxprocs > 0 {
+    // Normal operation - 启用 cgroup 感知
+    cgroupCPU = c
+    cgroupOK = true
+    return
+}
+// cgroup-aware GOMAXPROCS is disabled.
+```
+
+禁用后，`GOMAXPROCS` 将只基于 `sched_getaffinity` 返回的 CPU 数，不再受 cgroup limit 限制。
+
+---
+
 ## 何时仍需要 automaxprocs
 
 `go.uber.org/automaxprocs` 在以下场景仍有价值：
